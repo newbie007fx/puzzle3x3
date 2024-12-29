@@ -22,7 +22,7 @@ func createBoardGame(length int) *BoardGame {
 		mapResultTarget: map[int]game.Point{},
 	}
 
-	dataSlice := generateSliceData(length * length)
+	dataSlice := generateSliceData(length)
 
 	index := 0
 	for row := range boardGame.board {
@@ -47,11 +47,16 @@ func createBoardGame(length int) *BoardGame {
 }
 
 func generateSliceData(length int) []int {
-	dataSlice := rand.Perm(length)
+	totalLengh := length * length
+	dataSlice := rand.Perm(totalLengh)
 
 	var countInversion, lastI, lastJ int
+	basePointRow := 1
 	for i := range len(dataSlice) - 1 {
 		for j := i + 1; j < len(dataSlice); j++ {
+			if dataSlice[i] == 0 {
+				basePointRow = length - int(i/length)
+			}
 			if dataSlice[i] > 0 && dataSlice[j] > 0 && dataSlice[i] > dataSlice[j] {
 				countInversion++
 				lastI = i
@@ -60,7 +65,14 @@ func generateSliceData(length int) []int {
 		}
 	}
 
-	if countInversion%2 == 1 {
+	swap := countInversion%2 == 1
+	if length%2 == 0 {
+		if basePointRow%2 == 0 {
+			swap = countInversion%2 == 0
+		}
+	}
+
+	if swap {
 		dataSlice[lastI], dataSlice[lastJ] = dataSlice[lastJ], dataSlice[lastI]
 	}
 
@@ -89,7 +101,8 @@ func (bg *BoardGame) runGame(action game.ACTION) bool {
 
 func (bg *BoardGame) runAutoSolve() {
 	fmt.Println("running auto solve")
-	steps := astar.FindSteps(bg.board, bg.point, bg.mapResultTarget)
+	solver := astar.CreateGameSolver(bg.mapResultTarget)
+	steps := solver.FindSteps(bg.board, bg.point)
 	if len(steps) > 0 {
 		fmt.Printf("found %d steps, starting steps \n", len(steps))
 		for _, step := range steps {

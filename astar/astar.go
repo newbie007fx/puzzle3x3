@@ -1,8 +1,11 @@
 package astar
 
 import (
+	"context"
 	"puzzle3x3/game"
 	"sort"
+	"sync"
+	"time"
 )
 
 type Node struct {
@@ -41,62 +44,149 @@ func (n Node) GetValidNeighborPoints() map[game.ACTION]game.Point {
 	return result
 }
 
-func reconstructMoves(goalNode *Node) []game.ACTION {
+type AstarGameSolver struct {
+	MapResultTarget map[int]game.Point
+	OpenList        []*Node
+	OpenMap         map[string]*Node
+	ClosedMap       map[string]*Node
+	FinalNode       *Node
+	sync.RWMutex
+}
+
+func CreateGameSolver(mapResultTarget map[int]game.Point) *AstarGameSolver {
+	return &AstarGameSolver{
+		MapResultTarget: mapResultTarget,
+		OpenList:        []*Node{},
+		OpenMap:         map[string]*Node{},
+		ClosedMap:       map[string]*Node{},
+	}
+}
+
+func (a *AstarGameSolver) popNode() *Node {
+	a.RWMutex.Lock()
+	defer a.RWMutex.Unlock()
+
+	if len(a.OpenList) == 0 {
+		return nil
+	}
+
+	var currentNode *Node
+	currentNode, a.OpenList = a.OpenList[0], a.OpenList[1:]
+	delete(a.OpenMap, currentNode.Board.ToString())
+	a.ClosedMap[currentNode.Board.ToString()] = currentNode
+
+	return currentNode
+}
+
+func (a *AstarGameSolver) isNodeKeyClosed(key string) bool {
+	a.RWMutex.RLock()
+	defer a.RWMutex.RUnlock()
+
+	_, ok := a.ClosedMap[key]
+
+	return ok
+}
+
+func (a *AstarGameSolver) getOpenNodeByKey(key string) *Node {
+	a.RWMutex.RLock()
+	defer a.RWMutex.RUnlock()
+
+	if node, ok := a.ClosedMap[key]; ok {
+		return node
+	}
+
+	return nil
+}
+
+func (a *AstarGameSolver) setOpenNode(key string, node *Node) {
+	a.RWMutex.Lock()
+	defer a.RWMutex.Unlock()
+	a.OpenList = a.appendData(a.OpenList, node)
+	a.OpenMap[key] = node
+}
+
+func (a *AstarGameSolver) reconstructMoves(goalNode *Node) []game.ACTION {
 	moves := []game.ACTION{}
 
 	if goalNode != nil && goalNode.Move != game.MOVE_NONE {
 		moves = append([]game.ACTION{goalNode.Move}, moves...)
-		nextMoves := reconstructMoves(goalNode.Parent)
+		nextMoves := a.reconstructMoves(goalNode.Parent)
 		moves = append(nextMoves, moves...)
 	}
 
 	return moves
 }
 
-func FindSteps(board game.Board, basePoint game.Point, mapResultTarget map[int]game.Point) []game.ACTION {
-	startNode := createNode(board, basePoint, 0, board.CalcaulateDistanceFromTarget(mapResultTarget), game.MOVE_NONE, nil)
-	openList := []*Node{startNode}
-	openMap := map[string]*Node{board.ToString(): startNode}
-	closedMap := map[string]*Node{}
+func (a *AstarGameSolver) FindSteps(board game.Board, basePoint game.Point) []game.ACTION {
+	startNode := createNode(board, basePoint, 0, board.CalcaulateDistanceFromTarget(a.MapResultTarget), game.MOVE_NONE, nil)
+	a.OpenList = append(a.OpenList, startNode)
+	a.OpenMap[board.ToString()] = startNode
 
-	var currentNode *Node
-	for len(openList) > 0 {
-		currentNode, openList = openList[0], openList[1:]
-		currentBoard := currentNode.Board
+	complete := make(chan int, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	for range 2 {
+		go a.workerRun(ctx, complete)
+	}
 
-		if currentBoard.CalcaulateDistanceFromTarget(mapResultTarget) == 0 {
-			return reconstructMoves(currentNode)
-		}
+	<-complete
+	cancel()
 
-		closedMap[currentBoard.ToString()] = currentNode
-		for move, neighborPoint := range currentNode.GetValidNeighborPoints() {
-			neighborBoard := copyBoard(currentBoard)
-			neighborBoard.SwapPoint(currentNode.BasePoint, neighborPoint)
-			neighborBoardString := neighborBoard.ToString()
-			if _, ok := closedMap[neighborBoardString]; ok {
-				continue
-			}
+	return a.reconstructMoves(a.FinalNode)
+}
 
-			tentativeG := currentNode.G + 1
+func (a *AstarGameSolver) workerRun(ctx context.Context, completed chan int) {
+	for {
+		select {
+		case <-ctx.Done():
 
-			if _, ok := openMap[neighborBoardString]; !ok {
-				neighbor := createNode(neighborBoard, neighborPoint, tentativeG, neighborBoard.CalcaulateDistanceFromTarget(mapResultTarget), move, currentNode)
-				openList = appendData(openList, neighbor)
-				openMap[neighborBoardString] = neighbor
-			} else if tentativeG < openMap[neighborBoardString].G {
-				neighbor := openMap[neighborBoardString]
-				neighbor.Move = move
-				neighbor.G = tentativeG
-				neighbor.F = tentativeG + neighbor.H
-				neighbor.Parent = currentNode
+			return
+		default:
+			if a.process() {
+				completed <- 0
+				return
 			}
 		}
 	}
-
-	return []game.ACTION{}
 }
 
-func appendData(data []*Node, item *Node) []*Node {
+func (a *AstarGameSolver) process() bool {
+	currentNode := a.popNode()
+	if currentNode == nil {
+		time.Sleep(time.Second)
+		return false
+	}
+
+	currentBoard := currentNode.Board
+	if currentBoard.CalcaulateDistanceFromTarget(a.MapResultTarget) == 0 {
+		a.FinalNode = currentNode
+		return true
+	}
+
+	for move, neighborPoint := range currentNode.GetValidNeighborPoints() {
+		neighborBoard := a.copyBoard(currentBoard)
+		neighborBoard.SwapPoint(currentNode.BasePoint, neighborPoint)
+		neighborBoardString := neighborBoard.ToString()
+		if a.isNodeKeyClosed(neighborBoardString) {
+			continue
+		}
+
+		tentativeG := currentNode.G + 1
+		neighbor := a.getOpenNodeByKey(neighborBoardString)
+		if neighbor == nil {
+			neighbor = createNode(neighborBoard, neighborPoint, tentativeG, neighborBoard.CalcaulateDistanceFromTarget(a.MapResultTarget), move, currentNode)
+			a.setOpenNode(neighborBoardString, neighbor)
+		} else if tentativeG < neighbor.G {
+			neighbor.Move = move
+			neighbor.G = tentativeG
+			neighbor.F = tentativeG + neighbor.H
+			neighbor.Parent = currentNode
+		}
+	}
+
+	return false
+}
+
+func (a *AstarGameSolver) appendData(data []*Node, item *Node) []*Node {
 	i := sort.Search(len(data), func(i int) bool { return data[i].F >= item.F })
 	data = append(data, &Node{})
 	copy(data[i+1:], data[i:])
@@ -104,7 +194,7 @@ func appendData(data []*Node, item *Node) []*Node {
 	return data
 }
 
-func copyBoard(board game.Board) game.Board {
+func (a *AstarGameSolver) copyBoard(board game.Board) game.Board {
 	tmpBoard := make(game.Board, len(board))
 	for i := range board {
 		tmpBoard[i] = make([]int, len(board[i]))
